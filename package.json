@@ -1,5 +1,6 @@
 {
   "name": "browse-ai-coordinator",
+  "version": "1.0.0",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
