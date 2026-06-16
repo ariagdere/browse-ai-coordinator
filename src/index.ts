@@ -12,7 +12,7 @@ const SESSION_TTL_MS   = 60 * 60 * 1000
 const PORT             = process.env.PORT || 3000
 
 // Cluster parametreleri (Python backfill ile aynı)
-const CLUSTER_MERGE_DIST = 300
+const CLUSTER_MERGE_DIST = 300   // peak etrafında ± bu kadar $
 const MIN_LIQ_USD        = 1_000_000
 
 const REQUIRED_ENV = ['ROBOT_1_ID', 'ROBOT_2_ID', 'APIFY_ACT_ID', 'APIFY_TOKEN', 'MAKE_WEBHOOK_URL']
@@ -82,29 +82,29 @@ function computeClusters(heatmap: any): ClusterResult {
     else if (price < refPrice) dn.push([price, usd])
   }
 
-  // Cluster birleştirme — en yoğun cluster'ı döndür
-  function dominantCluster(items: Array<[number, number]>, ascending: boolean) {
+  // Cluster — peak-merkezli: en yoğun seviyeyi bul, ±MERGE içindeki seviyeleri kat
+  function dominantCluster(items: Array<[number, number]>) {
     if (!items.length) return null
-    items.sort((a, b) => ascending ? a[0] - b[0] : b[0] - a[0])
-    const clusters: Array<{ mid: number; usd: number }> = []
-    let cp: number[] = [items[0][0]]
-    let cu = items[0][1]
-    for (let i = 1; i < items.length; i++) {
-      const [price, usd] = items[i]
-      if (Math.abs(price - cp[cp.length - 1]) <= CLUSTER_MERGE_DIST) {
-        cp.push(price); cu += usd
-      } else {
-        clusters.push({ mid: cp.reduce((a, b) => a + b, 0) / cp.length, usd: cu })
-        cp = [price]; cu = usd
+    // En yoğun tek seviye = peak
+    let peakPrice = items[0][0]
+    let peakUsd   = items[0][1]
+    for (const [price, usd] of items) {
+      if (usd > peakUsd) { peakUsd = usd; peakPrice = price }
+    }
+    // Peak ±CLUSTER_MERGE_DIST içindeki seviyeleri topla
+    let total = 0
+    let weightedSum = 0
+    for (const [price, usd] of items) {
+      if (Math.abs(price - peakPrice) <= CLUSTER_MERGE_DIST) {
+        total += usd
+        weightedSum += price * usd
       }
     }
-    clusters.push({ mid: cp.reduce((a, b) => a + b, 0) / cp.length, usd: cu })
-    clusters.sort((a, b) => b.usd - a.usd)
-    return clusters[0]
+    return { mid: weightedSum / total, usd: total }  // USD-ağırlıklı merkez
   }
 
-  const upC = dominantCluster(up, true)
-  const dnC = dominantCluster(dn, false)
+  const upC = dominantCluster(up)
+  const dnC = dominantCluster(dn)
 
   return {
     cluster_up_btc: upC ? Math.round(upC.mid * 100) / 100 : null,
