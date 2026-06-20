@@ -202,8 +202,42 @@ app.post('/webhook', async (req: Request, res: Response) => {
       return res.status(500).json({ ok: false, reason: 'apify dataset fetch failed' })
     }
     const clusters = computeClusters(heatmap)
-    session.apify = { runId, datasetId, datasetUrl, clusters }
     console.log(`[SESSION] apify (${datasetId}) clusters:`, clusters)
+
+    // Tüm cluster değerleri null ise dataset boş demektir — hata olarak bildir, session'a ekleme
+    const allNull = Object.values(clusters).every(v => v === null)
+    if (allNull) {
+      console.warn(`[APIFY] Empty dataset detected (${datasetId}), notifying as error`)
+
+      const have = [
+        session.robot1 ? 'robot1' : null,
+        session.robot2 ? 'robot2' : null,
+      ].filter(Boolean)
+
+      resetSession('Apify returned empty dataset')
+
+      try {
+        await fetch(MAKE_WEBHOOK_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'error',
+            reason: 'apify_empty_dataset',
+            datasetId,
+            runId,
+            have,
+            at: new Date().toISOString(),
+          }),
+        })
+        console.log('[MAKE] Error notification sent (empty dataset)')
+      } catch (err) {
+        console.error('[MAKE] Error notification failed:', err)
+      }
+
+      return res.json({ ok: false, reason: 'apify empty dataset, session reset' })
+    }
+
+    session.apify = { runId, datasetId, datasetUrl, clusters }
   }
 
   else {
