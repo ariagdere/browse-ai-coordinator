@@ -32,28 +32,54 @@ interface ClusterResult {
 interface Session {
   robot1?: { taskId: string }
   robot2?: { taskId: string }
-  apify?:  { runId: string; datasetId: string; datasetUrl: string; clusters: ClusterResult }
+  apify?:  { runId: string; datasetId: string; datasetUrl: string; clusters: ClusterResult; isEmpty: boolean }
   at: number
   timeoutHandle?: ReturnType<typeof setTimeout>
 }
 
 let session: Session = { at: Date.now() }
 
+// "Toplanma tamamlandı" = 3 kaynak da geldi (apify boş olsa bile sayılır)
 const isComplete = (s: Session) => !!(s.robot1 && s.robot2 && s.apify)
+
+function currentHave(s: Session): string[] {
+  return [
+    s.robot1 ? 'robot1' : null,
+    s.robot2 ? 'robot2' : null,
+    s.apify  ? 'apify'  : null,
+  ].filter((x): x is string => x !== null)
+}
 
 function resetSession(reason?: string) {
   if (session.timeoutHandle) {
     clearTimeout(session.timeoutHandle)
   }
   if (reason) {
-    const have = [
-      session.robot1 ? 'robot1' : null,
-      session.robot2 ? 'robot2' : null,
-      session.apify  ? 'apify'  : null,
-    ].filter(Boolean)
+    const have = currentHave(session)
     console.log(`[RESET] ${reason}. Dropping: ${have.join(', ') || 'nothing'}`)
   }
   session = { at: Date.now() }
+}
+
+async function notifyMakeError(reason: string, extra: Record<string, unknown> = {}) {
+  const have = currentHave(session)
+  try {
+    await fetch(MAKE_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: 'error',
+        reason,
+        have,
+        missing: ['robot1', 'robot2', 'apify'].filter(k => !have.includes(k)),
+        at: new Date().toISOString(),
+        ...extra,
+      }),
+    })
+    console.log(`[MAKE] Error notification sent (${reason})`)
+  } catch (err) {
+    console.error('[MAKE] Error notification failed:', err)
+  }
 }
 
 function startSessionTimeout() {
@@ -62,38 +88,16 @@ function startSessionTimeout() {
 
   console.log(`[TIMEOUT] Session timer started — 10 dakika`)
   session.timeoutHandle = setTimeout(async () => {
-    const have = [
-      session.robot1 ? 'robot1' : null,
-      session.robot2 ? 'robot2' : null,
-      session.apify  ? 'apify'  : null,
-    ].filter(Boolean)
-
+    await notifyMakeError('session_timeout')
     resetSession('Session timeout (10 min)')
-
-    try {
-      await fetch(MAKE_WEBHOOK_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          type: 'error',
-          reason: 'session_timeout',
-          have,
-          missing: ['robot1', 'robot2', 'apify'].filter(k => !have.includes(k)),
-          at: new Date().toISOString(),
-        }),
-      })
-      console.log('[MAKE] Error notification sent')
-    } catch (err) {
-      console.error('[MAKE] Error notification failed:', err)
-    }
   }, SESSION_TIMEOUT_MS)
 }
 
 // ─── CLUSTER HESABI ───────────────────────────────────────────────────────────
 function computeClusters(heatmap: any): ClusterResult {
-  const yAxis: number[] = heatmap.y_axis
-  const lld: number[][] = heatmap.liquidation_leverage_data
-  const candles: any[]  = heatmap.price_candlesticks
+  const yAxis: number[] = heatmap?.y_axis
+  const lld: number[][] = heatmap?.liquidation_leverage_data
+  const candles: any[]  = heatmap?.price_candlesticks
 
   const empty: ClusterResult = {
     cluster_up_btc: null, cluster_up_usd: null,
@@ -198,46 +202,16 @@ app.post('/webhook', async (req: Request, res: Response) => {
     }
 
     const heatmap = await fetchApifyDataset(datasetUrl, datasetId)
-    if (!heatmap) {
-      return res.status(500).json({ ok: false, reason: 'apify dataset fetch failed' })
+    const clusters = heatmap ? computeClusters(heatmap) : {
+      cluster_up_btc: null, cluster_up_usd: null,
+      cluster_dn_btc: null, cluster_dn_usd: null,
     }
-    const clusters = computeClusters(heatmap)
-    console.log(`[SESSION] apify (${datasetId}) clusters:`, clusters)
+    const isEmpty = Object.values(clusters).every(v => v === null)
+    console.log(`[SESSION] apify (${datasetId}) clusters:`, clusters, isEmpty ? '⚠️ EMPTY' : '')
 
-    // Tüm cluster değerleri null ise dataset boş demektir — hata olarak bildir, session'a ekleme
-    const allNull = Object.values(clusters).every(v => v === null)
-    if (allNull) {
-      console.warn(`[APIFY] Empty dataset detected (${datasetId}), notifying as error`)
-
-      const have = [
-        session.robot1 ? 'robot1' : null,
-        session.robot2 ? 'robot2' : null,
-      ].filter(Boolean)
-
-      resetSession('Apify returned empty dataset')
-
-      try {
-        await fetch(MAKE_WEBHOOK_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            type: 'error',
-            reason: 'apify_empty_dataset',
-            datasetId,
-            runId,
-            have,
-            at: new Date().toISOString(),
-          }),
-        })
-        console.log('[MAKE] Error notification sent (empty dataset)')
-      } catch (err) {
-        console.error('[MAKE] Error notification failed:', err)
-      }
-
-      return res.json({ ok: false, reason: 'apify empty dataset, session reset' })
-    }
-
-    session.apify = { runId, datasetId, datasetUrl, clusters }
+    // Boş olsa da session'a YAZ — diğer ikisini beklemeye devam et.
+    // Karar verme tamamlanma anında (3'ü de toplandığında) yapılacak.
+    session.apify = { runId, datasetId, datasetUrl, clusters, isEmpty }
   }
 
   else {
@@ -247,19 +221,26 @@ app.post('/webhook', async (req: Request, res: Response) => {
   // İlk webhook geldiğinde timer başlat
   startSessionTimeout()
 
-  // ─── TAMAMLANDI MI ────────────────────────────────────────────────────────
-  const have = [
-    session.robot1 ? 'robot1' : null,
-    session.robot2 ? 'robot2' : null,
-    session.apify  ? 'apify'  : null,
-  ].filter(Boolean)
+  // ─── TAMAMLANDI MI (3 kaynak da toplandı mı) ─────────────────────────────
+  const have = currentHave(session)
   console.log(`[STATE] Have: ${have.join(', ')}`)
 
   if (!isComplete(session)) {
     return res.json({ ok: true, waiting: true, have })
   }
 
-  // ─── MAKE'E GÖNDER ────────────────────────────────────────────────────────
+  // ─── 3'Ü DE TOPLANDI — ŞİMDİ APIFY GEÇERLİ Mİ KONTROL ET ────────────────
+  if (session.apify!.isEmpty) {
+    console.warn('[APIFY] Dataset empty after full collection — reporting error')
+    await notifyMakeError('apify_empty_dataset', {
+      datasetId: session.apify!.datasetId,
+      runId: session.apify!.runId,
+    })
+    resetSession('Apify dataset was empty (after full collection)')
+    return res.json({ ok: false, reason: 'apify empty dataset, session reset' })
+  }
+
+  // ─── MAKE'E GÖNDER (BAŞARILI) ─────────────────────────────────────────────
   const payload = {
     robot1: { robotId: ROBOT_1_ID, taskId: session.robot1!.taskId },
     robot2: { robotId: ROBOT_2_ID, taskId: session.robot2!.taskId },
@@ -299,6 +280,7 @@ app.get('/health', (_req: Request, res: Response) => {
   res.json({
     ok: true,
     have: { robot1: !!session.robot1, robot2: !!session.robot2, apify: !!session.apify },
+    apifyEmpty: session.apify?.isEmpty ?? null,
     sessionAge: Math.round(ageMs / 1000),
     timeoutIn: session.timeoutHandle
       ? Math.round((SESSION_TIMEOUT_MS - ageMs) / 1000)
